@@ -1,0 +1,127 @@
+name: Daily CRS Pull
+
+on:
+  schedule:
+    # 07:00 UTC daily. Lands at 03:00 EST in winter / 04:00 EDT in summer.
+    # GitHub cron does NOT observe DST; 1-hour seasonal drift is intentional.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      start-date:
+        description: "Start date (YYYY-MM-DD). Default: yesterday."
+        required: false
+        type: string
+      end-date:
+        description: "End date (YYYY-MM-DD). Default: same as start."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-crs-pull
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify API key secret is set
+        env:
+          CONGRESS_API_KEY: ${{ secrets.CONGRESS_API_KEY }}
+        run: |
+          if [ -z "$CONGRESS_API_KEY" ]; then
+            echo "::error::CONGRESS_API_KEY secret is not set. Add it under Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+      - name: Fetch CRS reports
+        env:
+          CONGRESS_API_KEY: ${{ secrets.CONGRESS_API_KEY }}
+          INPUT_START_DATE: ${{ inputs.start-date }}
+          INPUT_END_DATE: ${{ inputs.end-date }}
+        run: |
+          ARGS=()
+          if [ -n "$INPUT_START_DATE" ]; then
+            ARGS+=(--start-date "$INPUT_START_DATE")
+          fi
+          if [ -n "$INPUT_END_DATE" ]; then
+            ARGS+=(--end-date "$INPUT_END_DATE")
+          fi
+          python scripts/fetch_crs.py \
+            --db-path data/crs.db \
+            --metadata-path data/metadata.csv \
+            --pdf-dir ./pdfs \
+            --archive-dir ./archive \
+            --summary-path data/last-run-summary.json \
+            "${ARGS[@]}"
+
+      - name: Compute UTC run date
+        id: rundate
+        run: echo "value=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload PDFs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Per spec: artifact name uses the UTC date of the run.
+          # overwrite: true so a same-day workflow_dispatch updates the
+          # artifact instead of failing on name collision with the cron run.
+          name: crs-pdfs-${{ steps.rundate.outputs.value }}
+          path: ./pdfs
+          retention-days: 15
+          if-no-files-found: ignore
+          overwrite: true
+
+      - name: Commit updated dedup state
+        run: |
+          set -e
+          # Stage the data files we care about. .gitkeep stays put.
+          git add data/crs.db data/metadata.csv 2>/dev/null || true
+
+          # Nothing to commit? exit clean — weekends/holidays land here.
+          if git diff --cached --quiet; then
+            echo "No data changes; skipping commit."
+            exit 0
+          fi
+
+          # Build the commit message from the summary JSON.
+          if [ ! -f data/last-run-summary.json ]; then
+            echo "::error::Summary JSON missing; can't build commit message."
+            exit 1
+          fi
+          MSG=$(python scripts/format_commit_message.py data/last-run-summary.json)
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "$MSG"
+
+          # Push with one retry for race conditions (manual commits between
+          # our pull and our push). Conflicts on binary crs.db are not
+          # auto-resolvable; a second failure means a real issue.
+          for attempt in 1 2; do
+            git pull --rebase origin "${GITHUB_REF_NAME}" || {
+              echo "::error::git pull --rebase failed on attempt $attempt"
+              exit 1
+            }
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "Pushed on attempt $attempt"
+              exit 0
+            fi
+            echo "Push failed on attempt $attempt; retrying after 5s"
+            sleep 5
+          done
+          echo "::error::Push failed after retry"
+          exit 1

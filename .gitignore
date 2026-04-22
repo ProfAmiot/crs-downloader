@@ -1,0 +1,40 @@
+# Scratch from brainstorming
+extracted/
+*.skill
+
+# Local-CLI default output dir (when --output-dir is used)
+crs-tracker-data/
+
+# Workflow / local run outputs (PDFs are artifacts; archive is local-only)
+pdfs/
+archive/
+
+# Per-run summary; used by the workflow's commit step but not committed
+last-run-summary.json
+
+# Python cruft
+__pycache__/
+*.pyc
+
+# Local secrets
+.env
+
+# Claude Code local settings
+.claude/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
